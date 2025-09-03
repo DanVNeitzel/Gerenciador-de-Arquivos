@@ -14,7 +14,7 @@ $configTime = 5; // Defina o tempo de expiração da sessão em minutos (padrão
 $disallowed_patterns = ['*.php'];  // 
 $hidden_patterns = ['*.php', '*.css', '*.js', '.*']; // Extensões ocultas no índice do diretório
 
-$SENHA = '123456';  // Defina a senha, para acessar o gerenciador de arquivos ... (opcional)
+$SENHA = 'abc123';  // Defina a senha, para acessar o gerenciador de arquivos ... (opcional)
 
 if ($SENHA) {
 
@@ -309,6 +309,63 @@ elseif ($_POST['do'] == 'zip') {
   }
 
   echo json_encode(['success' => true, 'zip' => $dest_rel, 'added' => $added]);
+  exit;
+} elseif ($_POST['do'] == 'rename') {
+  $old = isset($_POST['file']) ? trim($_POST['file']) : '';
+  $newname = isset($_POST['newname']) ? trim($_POST['newname']) : '';
+  if ($old === '' || $newname === '')
+    err(400, "Missing parameters.");
+
+  // proibir caminhos relativos na nova string e barras
+  if (strpos($newname, '/') !== false || strpos($newname, '\\') !== false)
+    err(400, "Invalid new name.");
+
+  if (strpos($old, '..') !== false || preg_match('@^.+://@', $old))
+    err(403, "Forbidden");
+
+  // basic disallowed extensions check for target name
+  foreach ($disallowed_patterns as $pattern)
+    if (fnmatch($pattern, $newname))
+      err(403, "Target name disallowed by pattern.");
+
+  $tmp_dir = dirname($_SERVER['SCRIPT_FILENAME']);
+  if (DIRECTORY_SEPARATOR === '\\')
+    $tmp_dir = str_replace('/', DIRECTORY_SEPARATOR, $tmp_dir);
+
+  $old_abs = get_absolute_path($tmp_dir . '/' . $old);
+  if ($old_abs === false)
+    err(404, 'File or Directory Not Found');
+
+  if (substr($old_abs, 0, strlen($tmp_dir)) !== $tmp_dir)
+    err(403, "Forbidden");
+
+  // Ensure source exists
+  if (!file_exists($old_abs))
+    err(404, "Source not found.");
+
+  // Ensure parent dir writable
+  $parent_dir = dirname($old_abs);
+  if (!is_writable($parent_dir))
+    err(403, "Parent directory not writable.");
+
+  // Build new absolute path (keep same parent)
+  $new_rel = ($old === '.' ? $newname : (rtrim(dirname($old), '/\\') . '/' . $newname));
+  $new_abs = get_absolute_path($tmp_dir . '/' . $new_rel);
+  if ($new_abs === false)
+    err(500, "Failed to construct new path.");
+
+  if (substr($new_abs, 0, strlen($tmp_dir)) !== $tmp_dir)
+    err(403, "Forbidden");
+
+  // Prevent overwrite
+  if (file_exists($new_abs))
+    err(409, "Target already exists.");
+
+  // perform rename
+  if (!@rename($old_abs, $new_abs))
+    err(500, "Rename failed.");
+
+  echo json_encode(['success' => true, 'old' => $old, 'new' => $new_rel]);
   exit;
 }
 
@@ -685,6 +742,13 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
           .attr('href', data.is_dir ? '#' + encodeURIComponent(data.path) : './' + data.path)
           .text(data.name);
 
+        // botão de renomear (ícone lápis) ao lado do nome
+        var $rename_btn = null;
+        // mostrar se o arquivo/pasta puder ser renomeado (permite para itens editáveis ou deletáveis)
+        if (data.is_writable || data.is_deleteable) {
+          $rename_btn = $('<a href="#" class="rename-btn btn btn-outline-secondary btn-sm ms-2" title="Renomear"><i class="fa fa-pencil"></i></a>').attr('data-file', data.path);
+        }
+
         var allow_direct_link = <?php echo $allow_direct_link ? 'true' : 'false'; ?>;
         if (!data.is_dir && !allow_direct_link) $link.css('pointer-events', 'none');
 
@@ -736,7 +800,7 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         var $html = $('<tr />')
           .addClass(data.is_dir ? 'is_dir' : '')
           .append(
-            $('<td class="first d-flex align-items-center" />').append($checkbox).append($link)
+            $('<td class="first d-flex align-items-center" />').append($checkbox).append($link).append($rename_btn ? $rename_btn : '')
           )
           .append($('<td/>').attr('data-sort', data.is_dir ? -1 : data.size)
             .html($('<span class="size" />').text(formatFileSize(data.size))))
@@ -916,6 +980,138 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         $('#mediaPlayerAudio').attr('src','').hide();
         $('#mediaModal').fadeOut(120, function () { $(this).css('display','none'); });
         $('#mediaTitle').text('');
+      });
+
+      // ----------------------------
+      // JavaScript: adicionar ícone lápis e handlers de renomear
+      // procure no arquivo JS embutido a função renderFileRow e substitua/edite a parte correspondente.
+      /* dentro da função renderFileRow(data) - substitua/adicione conforme abaixo (mostramos apenas o trecho alterado) */
+      function renderFileRow(data) {
+        var $checkbox = $('<input type="checkbox" class="select-item me-2">').attr('data-file', data.path);
+        var $link = $('<a class="name" />')
+          .attr('href', data.is_dir ? '#' + encodeURIComponent(data.path) : './' + data.path)
+          .text(data.name);
+
+        // botão de renomear (ícone lápis) ao lado do nome
+        var $rename_btn = null;
+        // mostrar se o arquivo/pasta puder ser renomeado (permite para itens editáveis ou deletáveis)
+        if (data.is_writable || data.is_deleteable) {
+          $rename_btn = $('<a href="#" class="rename-btn btn btn-link btn-sm ms-2" title="Renomear"><i class="fa fa-pencil"></i></a>').attr('data-file', data.path);
+        }
+
+        var allow_direct_link = <?php echo $allow_direct_link ? 'true' : 'false'; ?>;
+        if (!data.is_dir && !allow_direct_link) $link.css('pointer-events', 'none');
+
+        var $dl_link = $('<a class="btn btn-outline-primary btn-md me-2"><i class="fa fa-download"></i></a>').attr('href', '?do=download&file=' + encodeURIComponent(data.path)).addClass('download');
+        var $delete_link = $('<a href="#" class="btn btn-outline-danger btn-md"><i class="fa fa-trash"></i></a>').attr('data-file', data.path).addClass('delete');
+        // Botão visualizar imagem
+        var imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
+        // ADDED: extensões de mídia
+        var audioExts = ['mp3','wav','ogg','m4a'];
+        var videoExts = ['mp4','webm','ogg','mkv'];
+        // ADDED: extensões PDF e botão visualizar PDF
+        var pdfExts = ['pdf'];
+        // ADDED: extensões de texto e botão editar
+        var textExts = ['txt','md','csv','html','htm','js','css','json','log','ini','xml','yaml','yml'];
+        var ext = data.name.split('.').pop().toLowerCase();
+        var $view_link = null;
+        if (!data.is_dir && imageExts.includes(ext)) {
+          $view_link = $('<a href="#" class="btn btn-outline-info btn-md me-2"><i class="fa fa-eye" aria-hidden="true"></i></a>').attr('data-file', data.path).addClass('view-image');
+        }
+
+        // ADDED: botão para reproduzir áudio
+        var $audio_link = null;
+        if (!data.is_dir && audioExts.includes(ext)) {
+          $audio_link = $('<a href="#" class="btn btn-outline-info btn-md me-2"><i class="fa fa-headphones" aria-hidden="true"></i></a>').attr('data-file', data.path).addClass('view-audio');
+        }
+        // ADDED: botão para reproduzir vídeo
+        var $video_link = null;
+        if (!data.is_dir && videoExts.includes(ext)) {
+          $video_link = $('<a href="#" class="btn btn-outline-info btn-md me-2"><i class="fa fa-video-camera" aria-hidden="true"></i></a>').attr('data-file', data.path).addClass('view-video');
+        }
+
+        // ADDED: botão para visualizar PDF inline
+        var $pdf_link = null;
+        if (!data.is_dir && pdfExts.includes(ext)) {
+          $pdf_link = $('<a href="#" class="btn btn-outline-info btn-md me-2"><i class="fa fa-file-pdf-o" aria-hidden="true"></i></a>').attr('data-file', data.path).addClass('view-pdf');
+        }
+
+        // ADJUSTED: criar botão Editar somente se o arquivo for gravável
+        var $edit_link = null;
+        if (!data.is_dir && textExts.includes(ext) && data.is_writable) {
+          $edit_link = $('<a href="#" class="btn btn-outline-info btn-md me-2"><i class="fa fa-edit"></i></a>').attr('data-file', data.path).addClass('edit-text');
+        }
+
+        var perms = [];
+        if (data.is_readable) perms.push('Visualizar ');
+        if (data.is_writable) perms.push(' Editar ');
+        if (data.is_executable) perms.push(' Executar');
+
+        var $html = $('<tr />')
+          .addClass(data.is_dir ? 'is_dir' : '')
+          .append(
+            $('<td class="first d-flex align-items-center" />').append($checkbox).append($link).append($rename_btn ? $rename_btn : '')
+          )
+          .append($('<td/>').attr('data-sort', data.is_dir ? -1 : data.size)
+            .html($('<span class="size" />').text(formatFileSize(data.size))))
+          .append($('<td/>').attr('data-sort', data.mtime).text(formatTimestamp(data.mtime)))
+          .append($('<td/>').text(perms.join('~')))
+          .append($('<td class="text-center" />')
+            .append($view_link ? $view_link : '')
+            .append($audio_link ? $audio_link : '')
+            .append($video_link ? $video_link : '')
+            .append($pdf_link ? $pdf_link : '')
+            .append($edit_link ? $edit_link : '')
+            .append(data.is_dir ? '' : $dl_link)
+            .append(data.is_deleteable ? $delete_link : '')
+          );
+
+        return $html;
+      }
+
+      /* handlers: após outros handlers JS (coloque junto dos outros .on('click', ...) handlers) */
+      $('#table').on('click', '.rename-btn', function (e) {
+        e.preventDefault();
+        var file = $(this).attr('data-file');
+        if (!file) return;
+        var $tr = $(this).closest('tr');
+        var $nameCell = $tr.find('td.first');
+        if ($nameCell.find('input.rename-input').length) return; // já em edição
+
+        var parts = file.split('/');
+        var currentName = decodeURIComponent(parts.pop());
+        var input = $('<input type="text" class="rename-input form-control form-control-sm" />').val(currentName).css('display','inline-block').css('width','50%');
+        var saveBtn = $('<button class="btn btn-sm btn-success ms-2">Salvar</button>');
+        var cancelBtn = $('<button class="btn btn-sm btn-secondary ms-1">Cancelar</button>');
+        // esconde link e mostra input+btns
+        $nameCell.find('a.name').hide();
+        $nameCell.append(input).append(saveBtn).append(cancelBtn);
+        input.focus();
+
+        cancelBtn.on('click', function () {
+          // restaurar
+          input.remove(); saveBtn.remove(); cancelBtn.remove();
+          $nameCell.find('a.name').show();
+        });
+
+        saveBtn.on('click', function () {
+          var newname = input.val().trim();
+          if (!newname) return alert('Nome inválido.');
+          // basic client-side sanitization
+          if (newname.indexOf('/') !== -1 || newname.indexOf('..') !== -1) return alert('Nome inválido.');
+          saveBtn.prop('disabled', true);
+          $.post('?', { do: 'rename', file: file, newname: newname, xsrf: XSRF }, function (res) {
+            saveBtn.prop('disabled', false);
+            if (res && res.success) {
+              list(); // recarrega a listagem atualizada
+            } else {
+              alert('Erro ao renomear: ' + (res && res.error ? res.error.msg : 'unknown'));
+            }
+          }, 'json').fail(function () {
+            saveBtn.prop('disabled', false);
+            alert('Falha na requisição de renomear.');
+          });
+        });
       });
     })
 
