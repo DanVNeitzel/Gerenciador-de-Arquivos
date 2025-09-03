@@ -7,6 +7,7 @@ error_reporting(error_reporting() & ~E_NOTICE);
 $allow_delete = true; // Defina como false para desativar o botão de exclusão e excluir a solicitação POST.
 $allow_upload = true; // Defina como true para permitir o upload de arquivos
 $allow_create_folder = true; // Defina como false para desativar a criação de pasta
+$allow_create_file = true; // ADDED: permitir criação de novos arquivos de texto via UI
 $allow_direct_link = true; // Defina como false para permitir apenas downloads e não link direto
 $allow_show_folders = true; // Defina como false para ocultar todos os subdiretórios
 $configTime = 5; // Defina o tempo de expiração da sessão em minutos (padrão: 5 minutos)
@@ -20,7 +21,7 @@ if ($SENHA) {
 
   session_start();
   // Expiração automática da sessão baseada em inatividade (valor em milissegundos)
-    $timeout = $configTime * 60 * 1000;
+  $timeout = $configTime * 60 * 1000;
   if (isset($_SESSION['LAST_ACTIVITY']) && ((time() * 1000) - $_SESSION['LAST_ACTIVITY'] > $timeout)) {
     session_unset();
     session_destroy();
@@ -176,6 +177,52 @@ if ($_GET['do'] == 'list') {
   chdir($file);
   @mkdir($_POST['name']);
   exit;
+}
+
+// ADDED: endpoint para criar novo arquivo de texto
+elseif ($_POST['do'] == 'createfile' && $allow_create_file) {
+  $folder = isset($_POST['file']) && $_POST['file'] !== '' ? $_POST['file'] : '.';
+  if (strpos($folder, '..') !== false)
+    err(403, "Forbidden folder.");
+
+  $name = isset($_POST['name']) ? trim($_POST['name']) : '';
+  if ($name === '')
+    err(400, "Missing file name.");
+
+  // proibir barras, backslashes e parent traversal
+  if (strpos($name, '/') !== false || strpos($name, '\\') !== false || strpos($name, '..') !== false)
+    err(400, "Invalid file name.");
+
+  // checar padrões proibidos
+  foreach ($disallowed_patterns as $pattern)
+    if (fnmatch($pattern, $name))
+      err(403, "Files of this type are not allowed.");
+
+  $tmp_dir = dirname($_SERVER['SCRIPT_FILENAME']);
+  if (DIRECTORY_SEPARATOR === '\\')
+    $tmp_dir = str_replace('/', DIRECTORY_SEPARATOR, $tmp_dir);
+
+  $abs = get_absolute_path($tmp_dir . '/' . $folder . '/' . $name);
+  if ($abs === false)
+    err(500, "Failed to construct path.");
+
+  if (substr($abs, 0, strlen($tmp_dir)) !== $tmp_dir)
+    err(403, "Forbidden");
+
+  if (file_exists($abs))
+    err(409, "File already exists.");
+
+  $parent_dir = dirname($abs);
+  if (!is_writable($parent_dir))
+    err(403, "Parent directory not writable.");
+
+  $content = isset($_POST['content']) ? $_POST['content'] : '';
+  $res = @file_put_contents($abs, $content, LOCK_EX);
+  if ($res === false)
+    err(500, "Failed to create file.");
+
+  echo json_encode(['success' => true, 'file' => ($folder === '.' ? $name : ($folder . '/' . $name))]);
+  exit;
 } elseif ($_POST['do'] == 'upload' && $allow_upload) {
   foreach ($disallowed_patterns as $pattern)
     if (fnmatch($pattern, $_FILES['file_data']['name']))
@@ -239,7 +286,7 @@ elseif ($_POST['do'] == 'savefile') {
   echo json_encode(['success' => true]);
   exit;
 }
-// --- ADDED: endpoint para criar um ZIP com arquivos selecionados ---
+// --- ADDED: endpoint para criar um ZIP com arquivos selecionados (AGORA suporta diretórios recursivamente) ---
 elseif ($_POST['do'] == 'zip') {
   if (!isset($_POST['files']) || !is_array($_POST['files']))
     err(400, "No files specified.");
@@ -293,11 +340,15 @@ elseif ($_POST['do'] == 'zip') {
     $abs = get_absolute_path($tmp_dir . '/' . $f);
     if ($abs === false) continue;
     if (substr($abs, 0, strlen($tmp_dir)) !== $tmp_dir) continue;
-    if (!is_file($abs) || !is_readable($abs)) continue;
 
-    // dentro do zip usar o nome base para evitar caminhos relativos estranhos
-    $zip->addFile($abs, basename($abs));
-    $added++;
+    // se for diretório, adicionar recursivamente mantendo estrutura (usa basename($f) como raiz no ZIP)
+    if (is_dir($abs)) {
+      addPathToZip($zip, $abs, basename($f), $disallowed_patterns, $added);
+    } elseif (is_file($abs) && is_readable($abs)) {
+      // arquivo simples
+      $zip->addFile($abs, basename($abs));
+      $added++;
+    }
   }
 
   $zip->close();
@@ -367,6 +418,42 @@ elseif ($_POST['do'] == 'zip') {
 
   echo json_encode(['success' => true, 'old' => $old, 'new' => $new_rel]);
   exit;
+}
+
+// ADDED: função auxiliar recursiva para adicionar diretórios/arquivos ao zip
+function addPathToZip($zip, $absPath, $localPath, $disallowed_patterns, &$added) {
+  // $absPath = caminho absoluto no servidor
+  // $localPath = caminho relativo a usar dentro do zip (string)
+  if (!is_readable($absPath)) return;
+
+  if (is_dir($absPath)) {
+    // adiciona diretório vazio no zip (se necessário)
+    $zip->addEmptyDir($localPath);
+
+    $files = array_diff(scandir($absPath), ['.', '..']);
+    foreach ($files as $entry) {
+      // filtrar padrões proibidos pelo nome base
+      foreach ($disallowed_patterns as $pattern) {
+        if (fnmatch($pattern, $entry)) {
+          continue 2;
+        }
+      }
+
+      $childAbs = $absPath . '/' . $entry;
+      $childLocal = $localPath === '' ? $entry : ($localPath . '/' . $entry);
+
+      if (is_dir($childAbs)) {
+        addPathToZip($zip, $childAbs, $childLocal, $disallowed_patterns, $added);
+      } elseif (is_file($childAbs) && is_readable($childAbs)) {
+        // adiciona arquivo preservando o caminho relativo dentro do zip
+        $zip->addFile($childAbs, $childLocal);
+        $added++;
+      }
+    }
+  } elseif (is_file($absPath) && is_readable($absPath)) {
+    $zip->addFile($absPath, $localPath);
+    $added++;
+  }
 }
 
 function is_entry_ignored($entry, $allow_show_folders, $hidden_patterns)
@@ -637,18 +724,18 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
           var filesToZip = $('.select-item:checked').map(function () {
             return $(this).attr('data-file');
           }).get();
-            if (!filesToZip.length) return alert('Nenhum arquivo selecionado.');
+          if (!filesToZip.length) return alert('Nenhum arquivo selecionado.');
 
-            var now = new Date();
-            var dia = String(now.getDate()).padStart(2, '0');
-            var mes = String(now.getMonth() + 1).padStart(2, '0');
-            var ano = now.getFullYear();
-            var hora = String(now.getHours()).padStart(2, '0');
-            var minuto = String(now.getMinutes()).padStart(2, '0');
-            var defaultName = 'Zip_' + dia + '_' + mes + '_' + ano + '_' + hora + '_' + minuto + '.zip';
-          var nameInput = prompt('Nome do arquivo zip (sem extensão) \nDeixe em branco para usar padrão:', defaultName.replace('.zip',''));
+          var now = new Date();
+          var dia = String(now.getDate()).padStart(2, '0');
+          var mes = String(now.getMonth() + 1).padStart(2, '0');
+          var ano = now.getFullYear();
+          var hora = String(now.getHours()).padStart(2, '0');
+          var minuto = String(now.getMinutes()).padStart(2, '0');
+          var defaultName = 'Zip_' + dia + '_' + mes + '_' + ano + '_' + hora + '_' + minuto + '.zip';
+          var nameInput = prompt('Nome do arquivo zip (sem extensão) \nDeixe em branco para usar padrão:', defaultName.replace('.zip', ''));
           if (nameInput === null) return; // cancel
-          var zipName = nameInput.trim() || defaultName.replace('.zip','');
+          var zipName = nameInput.trim() || defaultName.replace('.zip', '');
           if (!zipName.toLowerCase().endsWith('.zip')) zipName = zipName + '.zip';
 
           var folder = decodeURIComponent(window.location.hash.substr(1));
@@ -746,7 +833,7 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         var $rename_btn = null;
         // mostrar se o arquivo/pasta puder ser renomeado (permite para itens editáveis ou deletáveis)
         if (data.is_writable || data.is_deleteable) {
-          $rename_btn = $('<a href="#" class="rename-btn btn btn-outline-secondary btn-sm ms-2" title="Renomear"><i class="fa fa-pencil"></i></a>').attr('data-file', data.path);
+          $rename_btn = $('<a href="#" class="rename-btn btn btn-link btn-sm ms-2" title="Renomear"><i class="fa fa-pencil"></i></a>').attr('data-file', data.path);
         }
 
         var allow_direct_link = <?php echo $allow_direct_link ? 'true' : 'false'; ?>;
@@ -757,12 +844,12 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         // Botão visualizar imagem
         var imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
         // ADDED: extensões de mídia
-        var audioExts = ['mp3','wav','ogg','m4a'];
-        var videoExts = ['mp4','webm','ogg','mkv'];
+        var audioExts = ['mp3', 'wav', 'ogg', 'm4a'];
+        var videoExts = ['mp4', 'webm', 'ogg', 'mkv'];
         // ADDED: extensões PDF e botão visualizar PDF
         var pdfExts = ['pdf'];
         // ADDED: extensões de texto e botão editar
-        var textExts = ['txt','md','csv','html','htm','js','css','json','log','ini','xml','yaml','yml'];
+        var textExts = ['txt', 'md', 'csv', 'html', 'htm', 'js', 'css', 'json', 'log', 'ini', 'xml', 'yaml', 'yml'];
         var ext = data.name.split('.').pop().toLowerCase();
         var $view_link = null;
         if (!data.is_dir && imageExts.includes(ext)) {
@@ -917,7 +1004,7 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
           if (res && res.success) {
             $('#textEditStatus').text('Salvo com sucesso.');
             list(); // atualiza listagem (mtime/size)
-            setTimeout(function () { $('#textEditModal').fadeOut(150, function () { $(this).css('display','none'); }); $('#textEditStatus').text(''); }, 700);
+            setTimeout(function () { $('#textEditModal').fadeOut(150, function () { $(this).css('display', 'none'); }); $('#textEditStatus').text(''); }, 700);
           } else {
             $('#textEditStatus').text('Erro ao salvar.');
             alert('Erro ao salvar arquivo: ' + (res && res.error ? res.error.msg : 'unknown'));
@@ -936,13 +1023,13 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         if (!file) return;
         var src = './' + file;
         // força display:flex para manter centralizado
-        $('#pdfViewModal').css('display','flex').hide().fadeIn(150);
+        $('#pdfViewModal').css('display', 'flex').hide().fadeIn(150);
         $('#pdfViewModalIframe').attr('src', src);
       });
-      
+
       // fechar modal PDF
       $('#pdfViewModalClose').off('click').on('click', function () {
-        $('#pdfViewModal').fadeOut(120, function () { $(this).css('display','none'); });
+        $('#pdfViewModal').fadeOut(120, function () { $(this).css('display', 'none'); });
         $('#pdfViewModalIframe').attr('src', '');
       });
 
@@ -953,9 +1040,9 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         if (!file) return;
         var src = './' + file;
         // configura e mostra modal de mídia
-        $('#mediaModal').css('display','flex').hide().fadeIn(150);
+        $('#mediaModal').css('display', 'flex').hide().fadeIn(150);
         $('#mediaTitle').text(file);
-        $('#mediaPlayerVideo').hide().attr('src','');
+        $('#mediaPlayerVideo').hide().attr('src', '');
         $('#mediaPlayerAudio').attr('src', src).show()[0].play();
       });
 
@@ -964,9 +1051,9 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         var file = $(this).attr('data-file');
         if (!file) return;
         var src = './' + file;
-        $('#mediaModal').css('display','flex').hide().fadeIn(150);
+        $('#mediaModal').css('display', 'flex').hide().fadeIn(150);
         $('#mediaTitle').text(file);
-        $('#mediaPlayerAudio').hide().attr('src','');
+        $('#mediaPlayerAudio').hide().attr('src', '');
         $('#mediaPlayerVideo').attr('src', src).show()[0].play();
       });
 
@@ -974,11 +1061,11 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
       $('#mediaModalClose').off('click').on('click', function () {
         var v = $('#mediaPlayerVideo')[0];
         var a = $('#mediaPlayerAudio')[0];
-        try { if (v && !v.paused) v.pause(); } catch(e){}
-        try { if (a && !a.paused) a.pause(); } catch(e){}
-        $('#mediaPlayerVideo').attr('src','').hide();
-        $('#mediaPlayerAudio').attr('src','').hide();
-        $('#mediaModal').fadeOut(120, function () { $(this).css('display','none'); });
+        try { if (v && !v.paused) v.pause(); } catch (e) { }
+        try { if (a && !a.paused) a.pause(); } catch (e) { }
+        $('#mediaPlayerVideo').attr('src', '').hide();
+        $('#mediaPlayerAudio').attr('src', '').hide();
+        $('#mediaModal').fadeOut(120, function () { $(this).css('display', 'none'); });
         $('#mediaTitle').text('');
       });
 
@@ -1007,12 +1094,12 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         // Botão visualizar imagem
         var imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
         // ADDED: extensões de mídia
-        var audioExts = ['mp3','wav','ogg','m4a'];
-        var videoExts = ['mp4','webm','ogg','mkv'];
+        var audioExts = ['mp3', 'wav', 'ogg', 'm4a'];
+        var videoExts = ['mp4', 'webm', 'ogg', 'mkv'];
         // ADDED: extensões PDF e botão visualizar PDF
         var pdfExts = ['pdf'];
         // ADDED: extensões de texto e botão editar
-        var textExts = ['txt','md','csv','html','htm','js','css','json','log','ini','xml','yaml','yml'];
+        var textExts = ['txt', 'md', 'csv', 'html', 'htm', 'js', 'css', 'json', 'log', 'ini', 'xml', 'yaml', 'yml'];
         var ext = data.name.split('.').pop().toLowerCase();
         var $view_link = null;
         if (!data.is_dir && imageExts.includes(ext)) {
@@ -1069,50 +1156,48 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         return $html;
       }
 
-      /* handlers: após outros handlers JS (coloque junto dos outros .on('click', ...) handlers) */
-      $('#table').on('click', '.rename-btn', function (e) {
+      // ADDED: código para criar novo arquivo via modal
+      $('#createFileForm').on('submit', function (e) {
         e.preventDefault();
-        var file = $(this).attr('data-file');
-        if (!file) return;
-        var $tr = $(this).closest('tr');
-        var $nameCell = $tr.find('td.first');
-        if ($nameCell.find('input.rename-input').length) return; // já em edição
+        var folder = decodeURIComponent(window.location.hash.substr(1)) || '.';
+        var name = $('#newfilename').val().trim();
+        var content = $('#newfilecontent').val();
+        if (!name) { alert('Nome inválido.'); return; }
+        // client-side sanity
+        if (name.indexOf('/') !== -1 || name.indexOf('\\') !== -1 || name.indexOf('..') !== -1) { alert('Nome inválido.'); return; }
 
-        var parts = file.split('/');
-        var currentName = decodeURIComponent(parts.pop());
-        var input = $('<input type="text" class="rename-input form-control form-control-sm" />').val(currentName).css('display','inline-block').css('width','50%');
-        var saveBtn = $('<button class="btn btn-sm btn-success ms-2">Salvar</button>');
-        var cancelBtn = $('<button class="btn btn-sm btn-secondary ms-1">Cancelar</button>');
-        // esconde link e mostra input+btns
-        $nameCell.find('a.name').hide();
-        $nameCell.append(input).append(saveBtn).append(cancelBtn);
-        input.focus();
+        var $btn = $(this).find('button[type=submit]');
+        $btn.prop('disabled', true);
+        $('#createFileError').hide().text('');
 
-        cancelBtn.on('click', function () {
-          // restaurar
-          input.remove(); saveBtn.remove(); cancelBtn.remove();
-          $nameCell.find('a.name').show();
-        });
-
-        saveBtn.on('click', function () {
-          var newname = input.val().trim();
-          if (!newname) return alert('Nome inválido.');
-          // basic client-side sanitization
-          if (newname.indexOf('/') !== -1 || newname.indexOf('..') !== -1) return alert('Nome inválido.');
-          saveBtn.prop('disabled', true);
-          $.post('?', { do: 'rename', file: file, newname: newname, xsrf: XSRF }, function (res) {
-            saveBtn.prop('disabled', false);
-            if (res && res.success) {
-              list(); // recarrega a listagem atualizada
-            } else {
-              alert('Erro ao renomear: ' + (res && res.error ? res.error.msg : 'unknown'));
-            }
-          }, 'json').fail(function () {
-            saveBtn.prop('disabled', false);
-            alert('Falha na requisição de renomear.');
-          });
+        $.post('?', { do: 'createfile', file: folder, name: name, content: content, xsrf: XSRF }, function (res) {
+          $btn.prop('disabled', false);
+          if (res && res.success) {
+            // fechar modal (Bootstrap)
+            var modalEl = document.getElementById('createFileModal');
+            var modal = bootstrap.Modal.getInstance(modalEl);
+            if (modal) modal.hide();
+            // limpar campos
+            $('#newfilename').val(''); $('#newfilecontent').val('');
+            list(); // atualiza listagem
+          } else {
+            $('#createFileError').show().text((res && res.error) ? res.error.msg : 'Erro ao criar arquivo.');
+            alert('Erro ao criar arquivo: ' + ((res && res.error) ? res.error.msg : 'unknown'));
+          }
+        }, 'json').fail(function () {
+          $btn.prop('disabled', false);
+          $('#createFileError').show().text('Falha na requisição.');
+          alert('Falha ao criar arquivo.');
         });
       });
+
+      // limpar modal ao fechar
+      var createFileModalEl = document.getElementById('createFileModal');
+      if (createFileModalEl) {
+        createFileModalEl.addEventListener('hidden.bs.modal', function () {
+          $('#newfilename').val(''); $('#newfilecontent').val(''); $('#createFileError').hide().text('');
+        });
+      }
     })
 
   </script>
@@ -1129,30 +1214,41 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
         <ul class="navbar-nav d-flex flex-end">
           <li class="nav-item mr-15">
             <button class="btn btn-success btn-width-custom" type="button" data-bs-toggle="modal"
-              data-bs-target="#createFolder">
+              data-bs-target="#createFolder" title="Criar Pasta">
               <i class="fa fa-folder-o" aria-hidden="true"></i>
             </button>
           </li>
+
+          <!-- ADDED: botão Criar Arquivo -->
+          <li class="nav-item mr-15">
+            <button class="btn btn-secondary btn-width-custom" type="button" data-bs-toggle="modal"
+              data-bs-target="#createFileModal" title="Criar Arquivo">
+              <i class="fa fa-file-o" aria-hidden="true"></i>
+            </button>
+          </li>
+
           <li class="nav-item mr-15">
             <button class="btn btn-primary btn-width-custom" type="button" data-bs-toggle="modal"
-              data-bs-target="#makeUpload">
+              data-bs-target="#makeUpload" title="Carregar arquivos">
               <i class="fa fa-upload" aria-hidden="true"></i>
             </button>
           </li>
           <li class="nav-item">
             <button class="btn btn-warning btn-width-custom text-white" type="button" onClick="window.location.reload()"
-              data-bs-target="#makeUpload">
+              data-bs-target="#makeUpload" title="Atualizar lista">
               <i class="fa fa-refresh" aria-hidden="true"></i>
             </button>
           </li>
           <li class="nav-item mr-15">
-            <button id="deleteSelectedBtn" class="btn btn-danger btn-width-custom" type="button" disabled>
+            <button id="deleteSelectedBtn" class="btn btn-danger btn-width-custom" type="button"
+              title="Excluir Selecionados" disabled>
               <i class="fa fa-trash"></i> (Selecionados)
             </button>
           </li>
           <!-- ADDED: botão para criar ZIP dos selecionados -->
           <li class="nav-item mr-15">
-            <button id="zipSelectedBtn" class="btn btn-info btn-width-custom" type="button" disabled>
+            <button id="zipSelectedBtn" class="btn btn-info btn-width-custom" type="button" title="Zip Selecionados"
+              disabled>
               <i class="fa fa-file-archive-o"></i> (Zip)
             </button>
           </li>
@@ -1190,17 +1286,22 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
   </div>
 
   <!-- ADDED: Modal para visualização de PDF -->
-  <div id="pdfViewModal" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.75);z-index:10001;align-items:center;justify-content:center;">
-    <div style="position:relative;width:90%;height:90%;background:#fff;border-radius:8px;overflow:hidden;display:flex;flex-direction:column;">
+  <div id="pdfViewModal"
+    style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.75);z-index:10001;align-items:center;justify-content:center;">
+    <div
+      style="position:relative;width:90%;height:90%;background:#fff;border-radius:8px;overflow:hidden;display:flex;flex-direction:column;">
       <button id="pdfViewModalClose" class="btn btn-light" style="z-index:10002;">Fechar</button>
       <iframe id="pdfViewModalIframe" src="" style="flex:1;border:0;width:100%;height:100%;"></iframe>
     </div>
   </div>
 
   <!-- ADDED: Modal para reprodução de áudio / vídeo -->
-  <div id="mediaModal" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.75);z-index:10002;align-items:center;justify-content:center;">
-    <div style="position:relative;width:90%;max-width:1100px;height:80%;background:#fff;border-radius:8px;overflow:hidden;display:flex;flex-direction:column;">
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid #ddd;">
+  <div id="mediaModal"
+    style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.75);z-index:10002;align-items:center;justify-content:center;">
+    <div
+      style="position:relative;width:90%;max-width:1100px;height:80%;background:#fff;border-radius:8px;overflow:hidden;display:flex;flex-direction:column;">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid #ddd;">
         <div id="mediaTitle" style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
         <button id="mediaModalClose" class="btn btn-light">Fechar</button>
       </div>
@@ -1286,11 +1387,43 @@ $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('uploa
     </div>
   </div>
 
+  <!-- ADDED: Modal para criar novo arquivo -->
+  <div class="modal" id="createFileModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <form id="createFileForm">
+          <div class="modal-header">
+            <h5 class="modal-title">Criar Novo Arquivo de Texto</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+            <div class="mb-2">
+              <label for="newfilename" class="form-label">Nome do arquivo (ex: novo.txt)</label>
+              <input type="text" id="newfilename" class="form-control" placeholder="nome-do-arquivo.txt" required>
+            </div>
+            <div class="mb-2">
+              <label for="newfilecontent" class="form-label">Conteúdo inicial (opcional)</label>
+              <textarea id="newfilecontent" class="form-control" rows="6" placeholder="Conteúdo inicial..."></textarea>
+            </div>
+            <div id="createFileError" class="text-danger" style="display:none;"></div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+            <button type="submit" class="btn btn-primary">Criar Arquivo</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
   <!-- ADDED: Modal simples para editar arquivos de texto -->
-  <div id="textEditModal" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.6);z-index:10000;align-items:center;justify-content:center;">
-    <div style="position:relative;max-width:90vw;max-height:90vh;margin:auto;background:#fff;padding:16px;border-radius:8px;">
+  <div id="textEditModal"
+    style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.6);z-index:10000;align-items:center;justify-content:center;">
+    <div
+      style="position:relative;max-width:90vw;max-height:90vh;margin:auto;background:#fff;padding:16px;border-radius:8px;">
       <h5>Editor de Texto</h5>
-      <textarea id="textEditArea" style="width:80vw;height:60vh;display:block;margin-bottom:8px;font-family:monospace;"></textarea>
+      <textarea id="textEditArea"
+        style="width:80vw;height:60vh;display:block;margin-bottom:8px;font-family:monospace;"></textarea>
       <div class="d-flex justify-content-between">
         <div id="textEditStatus" style="align-self:center;color:#333;"></div>
         <div>
