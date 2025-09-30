@@ -2,7 +2,7 @@
 
 Pequeno gerenciador de arquivos em PHP com interface web e API para listar, enviar, baixar, excluir, renomear, criar pastas, criar arquivos de texto, editar arquivos, pré-visualizar mídias e gerar ZIPs (recursivo).
 
-Arquivo principal: [index.php](index.php)
+Arquivo principal: [files/index.php](index.php)
 
 ## Novas funcionalidades adicionadas
 - Criar novo arquivo de texto via UI (modal) e endpoint: POST `do=createfile`.  
