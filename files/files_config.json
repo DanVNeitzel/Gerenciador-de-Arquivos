@@ -21,6 +21,6 @@
         "*.js",
         ".*"
     ],
-    "SENHA": "123456",
+    "SENHA": "abc123",
     "permissionAdmin": true
 }
