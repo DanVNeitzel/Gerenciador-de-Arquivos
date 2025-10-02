@@ -1,0 +1,26 @@
+{
+    "allow_delete": true,
+    "allow_upload": true,
+    "allow_create_folder": true,
+    "allow_create_file": true,
+    "allow_direct_link": true,
+    "allow_show_folders": true,
+    "configTime": 35,
+    "max_upload_size_mb": 1000,
+    "disallowed_patterns": [
+        "*.exe",
+        "*.php",
+        "*.css",
+        "*.js",
+        ".*"
+    ],
+    "hidden_patterns": [
+        "*.exe",
+        "*.php",
+        "*.css",
+        "*.js",
+        ".*"
+    ],
+    "SENHA": "123456",
+    "permissionAdmin": true
+}
